@@ -16,6 +16,7 @@ import pandas as pd
 import streamlit as st
 
 import quiniela_model as qm
+import quiniela_ligaf as ql
 import quiniela_optimizer as qo
 import quiniela_scraper as qs
 
@@ -55,6 +56,11 @@ def entrenar(n_partidos: int, ultima_fecha: str, _hist: pd.DataFrame) -> dict:
     return qm.train_pipeline(_hist)
 
 
+@st.cache_data(ttl=12 * 3600, show_spinner=False)
+def cargar_liga_f() -> pd.DataFrame:
+    return ql.load_liga_f(n_seasons=2)
+
+
 @st.cache_data(ttl=600, show_spinner=False)
 def cargar_jornada() -> dict:
     return qs.fetch_jornada()
@@ -71,11 +77,12 @@ st.caption("Dixon-Coles + XGBoost frente al reparto de apuestas del público. He
 # --------------------------------------------------------------------------------------
 # 1) Modelo
 # --------------------------------------------------------------------------------------
-with st.expander("➕ Histórico extra: Liga F u otras competiciones (opcional)"):
-    st.caption("football-data.co.uk solo cubre Primera y Segunda. Para que el modelo conozca el fútbol femenino, "
-               "sube aquí un CSV de partidos con columnas Date, Home, Away, HG, AG (también vale el formato de "
-               "football-data o el «CSV de Partidos» de FootyStats). Para que quede fijo, súbelo a GitHub con el "
-               "nombre `liga_f.csv`, junto a app.py. Sin él, los partidos femeninos usan las cuotas de las casas.")
+with st.expander("➕ Histórico extra: Liga F u otras competiciones"):
+    auto_f = st.checkbox("Descargar la Liga F automáticamente (Wikipedia, gratis)", value=True,
+                         help="Resultados de las dos últimas temporadas. Si Wikipedia no da las fechas, se reparten de "
+                              "forma aproximada a lo largo de la temporada.")
+    st.caption("Opcional: sube tu propio CSV de partidos (Date, Home, Away, HG, AG; también vale el formato de "
+               "football-data). Para que quede fijo, súbelo a GitHub como `liga_f.csv` junto a app.py.")
     subido = st.file_uploader("CSV de partidos", type="csv")
     es_fem = st.checkbox("Son partidos de fútbol femenino", value=True)
 
@@ -83,6 +90,12 @@ try:
     with st.spinner("Descargando datos y entrenando el modelo (solo la primera vez, puede tardar ~1 min)…"):
         hist = cargar_historico()
         extras = []
+        if auto_f:
+            try:
+                extras.append(cargar_liga_f())
+            except Exception as exc:
+                st.warning(f"No pude descargar la Liga F de Wikipedia ({exc}). Los partidos femeninos usarán las "
+                           "cuotas de las casas; también puedes subir un CSV.")
         fijo = Path(__file__).parent / "liga_f.csv"
         if fijo.exists():
             extras.append(qm.parse_extra_csv(fijo, femenino=True))
