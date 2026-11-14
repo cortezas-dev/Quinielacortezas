@@ -136,6 +136,23 @@ with st.expander(f"📋 Revisar partidos y porcentajes ({len(base)} partidos · 
             "pct_2": st.column_config.NumberColumn("2 %", min_value=0, max_value=100),
         })
 
+pl = (jornada or {}).get("pleno")
+with st.expander("⚽ Partido 15 · Pleno al 15 (goles de cada equipo)"):
+    st.caption("Cada equipo marca 0, 1, 2 o M (3 o más). Revisa los equipos y el % del público de cada opción.")
+    if pl:
+        st.write(f"**{pl['Local_quiniela']} - {pl['Visitante_quiniela']}**")
+    loc0 = (qs.map_team(pl["Local_quiniela"], known) if pl and pl["Local_quiniela"] else None) or SIN_HIST
+    vis0 = (qs.map_team(pl["Visitante_quiniela"], known) if pl and pl["Visitante_quiniela"] else None) or SIN_HIST
+    local15 = st.selectbox("Local", opciones, index=opciones.index(loc0), key="l15")
+    visit15 = st.selectbox("Visitante", opciones, index=opciones.index(vis0), key="v15")
+    hv = pl[f"{pref}_H"] if pl else [25, 25, 25, 25]
+    av = pl[f"{pref}_A"] if pl else [25, 25, 25, 25]
+    pl_df = st.data_editor(
+        pd.DataFrame({"0": [hv[0], av[0]], "1": [hv[1], av[1]], "2": [hv[2], av[2]], "M": [hv[3], av[3]]},
+                     index=["Local", "Visitante"]),
+        key="tabla_pleno", width="stretch", num_rows="fixed",
+        column_config={c: st.column_config.NumberColumn(c, min_value=0, max_value=100) for c in ["0", "1", "2", "M"]})
+
 # --------------------------------------------------------------------------------------
 # 3) Ajustes visuales
 # --------------------------------------------------------------------------------------
@@ -173,11 +190,21 @@ if (fixtures[["pct_1", "pct_X", "pct_2"]].sum(axis=1) <= 0).any():
     st.warning("Hay partidos con los tres porcentajes a 0. Revisa la tabla.")
     st.stop()
 
+pleno_arg = None
+pl_vals = pl_df.fillna(0).to_numpy(float)
+if pl_vals[0].sum() > 0 and pl_vals[1].sum() > 0:
+    sh, sa = np.clip(pl_vals[0], 1e-4, None), np.clip(pl_vals[1], 1e-4, None)
+    Sp = np.outer(sh / sh.sum(), sa / sa.sum())
+    pp = None if SIN_HIST in (local15, visit15) else qm.pleno_probs(trained, local15, visit15)
+    Pp = Sp if pp is None else peso * pp + (1 - peso) * Sp
+    pleno_arg = (Pp / Pp.sum(), Sp)
+
 try:
     result = qm.predict_fixtures(hist, fixtures, trained)
     Pa, S = qo.prepare_arrays(result, peso)
     cols = qo.optimizar(Pa, S, k=k, min_prob_signo=min_signo, min_prob_rel=min_rel, max_sorpresas=max_sorp,
-                        min_distancia=min_dist, bote=float(bote), n_columnas=recaud / precio, coste_columna=precio)
+                        min_distancia=min_dist, bote=float(bote), n_columnas=recaud / precio, coste_columna=precio,
+                        pleno=pleno_arg)
 except ValueError as exc:
     st.warning(f"{exc}")
     st.stop()
@@ -198,17 +225,20 @@ elif ev_total < 1:
             "sean las mejores posibles.")
 
 st.markdown("**Copia los signos al boleto** (icono de copiar arriba a la derecha del recuadro):")
-filas = [f"{i:02d}  " + " ".join(c) for i, c in enumerate(cols.columna, 1)]
+filas = [f"{i:02d}  " + " ".join(c) + (f"   | 15: {pl_}" if "pleno" in cols else "")
+         for i, (c, pl_) in enumerate(zip(cols.columna, cols.get("pleno", [""] * len(cols))), 1)]
 st.code("\n".join(filas), language="text")
 
 tabla = pd.DataFrame([list(c) for c in cols.columna], columns=[str(j) for j in range(1, n + 1)])
 tabla.insert(0, "#", range(1, len(tabla) + 1))
+if "pleno" in cols:
+    tabla["Pleno 15"] = cols["pleno"]
 tabla["1 de cada"] = cols["1_de_cada"].map(lambda v: f"{v:,}".replace(",", "."))
 tabla["Valor"] = cols["indice_valor"]
 tabla["EV/coste"] = cols["EV_sobre_coste"]
 st.dataframe(tabla, hide_index=True, width="stretch")
 st.caption("Valor = probabilidad de tu modelo ÷ cuota de público de esa columna (>1: juegas lo que el público infravalora). "
-           "El Pleno al 15 (goles) no está incluido: rellénalo tú.")
+           "Pleno 15 = goles del local - goles del visitante (M = 3 o más); se elige el de mejor valor para cada columna.")
 
 d1, d2 = st.columns(2)
 d1.download_button("⬇️ TXT para el boleto", qo.to_text(cols, result), "quiniela_optimizada.txt", width="stretch")

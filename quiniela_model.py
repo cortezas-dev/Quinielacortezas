@@ -424,6 +424,21 @@ def predict_fixtures(hist: pd.DataFrame, fixtures: pd.DataFrame, trained: dict) 
     return result
 
 
+def pleno_probs(trained: dict, home: str, away: str):
+    """
+    Pleno al 15: matriz 4x4 con P(local marca 0/1/2/M, visitante marca 0/1/2/M), M = 3 o más.
+    Sale de la matriz de marcadores de Dixon-Coles. None si algún equipo no tiene histórico.
+    """
+    dc = trained["dc"]
+    if home not in dc.attack_ or away not in dc.attack_:
+        return None
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        mat = dc.score_matrix(home, away)               # filas = goles local
+    rows = np.vstack([mat[0], mat[1], mat[2], mat[3:].sum(axis=0)])
+    return np.column_stack([rows[:, 0], rows[:, 1], rows[:, 2], rows[:, 3:].sum(axis=1)])
+
+
 def main(hist: pd.DataFrame | None = None, fixtures_csv: str = "quiniela_jornada.csv"):
     """Ejecución por consola (la web app usa train_pipeline / predict_fixtures directamente)."""
     hist = load_history(n_seasons=2) if hist is None else hist

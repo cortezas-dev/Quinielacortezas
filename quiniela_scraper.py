@@ -113,12 +113,62 @@ def parse_lines(lines: list[str]) -> dict:
         raise ScrapeError("Encontré los partidos pero no los porcentajes (cambio de formato).")
 
     jornada = re.search(r"JORNADA\s+(\d+)", text)
+    pleno = _parse_pleno(lines, seq[-1][0])
     return {
         "jornada": int(jornada.group(1)) if jornada else None,
         "cerrada": bool(re.search(r"JUEGO\s+CERRADO", text, flags=re.I)),
         "bote": _money(text, r"\bBote"),
         "premio_max": _money(text, r"puede\s+ganar"),
         "partidos": pd.DataFrame(rows),
+        "pleno": pleno,
+    }
+
+
+_DIAS = {"SAB", "DOM", "VIE", "LUN", "MAR", "MIE", "JUE"}
+
+
+def _parse_pleno(lines: list[str], after: int) -> dict | None:
+    """
+    Partido 15 (Pleno al 15): cada equipo marca 0, 1, 2 o M (3 o más). La página da, por
+    grupo (jugados, LAE, probables, jugados), 4 % del local y 4 % del visitante.
+    Devuelve None si no se encuentra (la app permite rellenarlo a mano).
+    """
+    start = next((k for k in range(after + 1, len(lines))
+                  if re.match(r"^15(\s+\S.*)?$", lines[k]) and not re.search(r"\d{1,2}:\d{2}", lines[k])), None)
+    if start is None:
+        return None
+    block = lines[start:start + 70]
+    names = []
+    first = re.match(r"^15\s*(.*)$", block[0]).group(1).strip()
+    if first:
+        names += [p.strip() for p in re.split(r"\s+-\s+", first)]
+    for ln in block[1:]:
+        if len(names) >= 2:
+            break
+        if ln in _DIAS or re.search(r"\d{1,2}:\d{2}", ln) or re.fullmatch(r"[\d\sM]+", ln):
+            break
+        names.append(ln)
+    # último marcador "0 1 2 M" y los 32 números que le siguen
+    end = None
+    for j, ln in enumerate(block):
+        if ln.replace(" ", "") == "012M":
+            end = j
+        elif ln == "M" and block[max(0, j - 3):j] == ["0", "1", "2"]:
+            end = j
+    if end is None:
+        return None
+    nums = []
+    for ln in block[end + 1:]:
+        for tok in re.split(r"\s+", ln.replace("%", " ")):
+            if re.fullmatch(r"\d{1,3}", tok):
+                nums.append(int(tok))
+        if len(nums) >= 32:
+            break
+    if len(nums) < 16:
+        return None
+    return {
+        "Local_quiniela": names[0] if names else "", "Visitante_quiniela": names[1] if len(names) > 1 else "",
+        "jug_H": nums[0:4], "jug_A": nums[4:8], "lae_H": nums[8:12], "lae_A": nums[12:16],
     }
 
 

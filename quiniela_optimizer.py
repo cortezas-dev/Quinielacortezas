@@ -37,6 +37,7 @@ import numpy as np
 import pandas as pd
 
 SIGNS = np.array(["1", "X", "2"])
+PLENO = ["0", "1", "2", "M"]          # goles de cada equipo en el Pleno al 15 (M = 3 o más)
 
 
 # ======================================================================================
@@ -119,6 +120,7 @@ def optimizar(
     n_columnas: float | None = None,  # columnas totales jugadas en la jornada (opcional)
     coste_columna: float = 0.75,    # € por columna (VERIFICA el precio vigente)
     n_candidatos: int = 20000,
+    pleno: tuple | None = None,     # (Pp, Sp): matrices 4x4 modelo y público del partido 15
 ) -> pd.DataFrame:
     n = Pa.shape[0]
     fav = Pa.argmax(axis=1)
@@ -175,8 +177,16 @@ def optimizar(
             "indice_valor": round(p / s, 2),   # >1 = juegas lo que el público infravalora
             "sorpresas": int((code != fav).sum()),
         }
+        p15 = s15 = 1.0
+        if pleno is not None:        # mejor marcador del partido 15 para esta columna
+            Pp, Sp = pleno
+            crit = Pp / (1 + n_columnas * s * Sp) if ev_mode else Pp
+            i, j = np.unravel_index(np.argmax(crit), crit.shape)
+            p15, s15 = float(Pp[i, j]), float(Sp[i, j])
+            row["pleno"] = f"{PLENO[i]}-{PLENO[j]}"
+            row["P_pleno"] = round(p15, 3)
         if ev_mode:
-            row["EV_euros"] = round(p * bote / (1 + n_columnas * s), 4)
+            row["EV_euros"] = round(p * p15 * bote / (1 + n_columnas * s * s15), 4)
             row["EV_sobre_coste"] = round(row["EV_euros"] / coste_columna, 3)
         out.append(row)
     res = pd.DataFrame(out)
@@ -196,7 +206,10 @@ def to_text(cols: pd.DataFrame, df: pd.DataFrame) -> str:
               "  Nº  " + " ".join(f"{i + 1:>2}" for i in range(len(df))) + "   P conjunta   índice valor"]
     for i, r in enumerate(cols.itertuples(), 1):
         signs = " ".join(f"{s:>2}" for s in r.columna)
-        lines.append(f"  {i:02d}  {signs}   {r.P_conjunta:.2e}   {r.indice_valor:>6}")
+        extra = f"   Pleno15: {r.pleno}" if "pleno" in cols.columns else ""
+        lines.append(f"  {i:02d}  {signs}   {r.P_conjunta:.2e}   {r.indice_valor:>6}{extra}")
+    if "pleno" in cols.columns:
+        lines += ["", "PLENO AL 15: goles del local - goles del visitante (0, 1, 2 o M = 3 o más)"]
     lines += ["", "AVISO: la quiniela retiene una parte de la recaudación; incluso con ventaja sobre el",
               "público, el retorno esperado puede seguir por debajo del coste. Juega con cabeza."]
     return "\n".join(lines)
