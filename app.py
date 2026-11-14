@@ -205,7 +205,11 @@ with st.expander("🛡️ Filtros anti-quimeras"):
     min_signo = st.slider("Probabilidad mínima por signo (%)", 0, 30, 10) / 100
     min_rel = st.slider("Probabilidad mínima de la columna vs. la más probable (%)", 1, 30, 5) / 100
     max_sorp = st.slider("Máx. de sorpresas por columna (signos que no son el favorito)", 0, 8, 4)
-    min_dist = st.slider("Distancia mínima entre columnas (signos distintos)", 1, 4, 2)
+    min_emp = st.slider("Mínimo de empates (X) por columna", 0, 6, 2,
+                        help="En una jornada de 14 partidos suelen salir 3 o 4 empates. Con 0, las columnas "
+                             "casi nunca llevan X porque el empate rara vez es el signo más probable de un partido.")
+    min_dist = st.slider("Distancia mínima entre columnas (signos distintos)", 1, 8, 3,
+                         help="Más distancia = columnas más distintas entre sí (no fallan todas a la vez).")
     peso = st.slider("Peso del modelo frente al público", 50, 100, 80, help="100 = solo modelo; menos = más cerca del público "
                      "(protege si el modelo está sobreconfiado)") / 100
 
@@ -238,7 +242,7 @@ if pl_vals[0].sum() > 0 and pl_vals[1].sum() > 0:
 try:
     result = qm.predict_fixtures(hist, fixtures, trained)
     Pa, S = qo.prepare_arrays(result, peso)
-    cols = qo.optimizar(Pa, S, k=k, min_prob_signo=min_signo, min_prob_rel=min_rel, max_sorpresas=max_sorp,
+    cols = qo.optimizar(Pa, S, k=k, min_prob_signo=min_signo, min_prob_rel=min_rel, max_sorpresas=max_sorp, min_empates=min_emp,
                         min_distancia=min_dist, bote=float(bote), n_columnas=recaud / precio, coste_columna=precio,
                         pleno=pleno_arg)
 except ValueError as exc:

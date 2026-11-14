@@ -104,7 +104,8 @@ def _enumerate_half(logP, logS, fav):
     lp = logP[rows, codes].sum(axis=1).astype(np.float32)
     ls = logS[rows, codes].sum(axis=1).astype(np.float32)
     ns = (codes != fav[rows]).sum(axis=1).astype(np.int8)   # nº de "sorpresas" (no favorito)
-    return codes, lp, ls, ns
+    nx = (codes == 1).sum(axis=1).astype(np.int8)           # nº de empates (X)
+    return codes, lp, ls, ns, nx
 
 
 def optimizar(
@@ -115,6 +116,7 @@ def optimizar(
     min_prob_rel: float = 0.05,     # columna >= 5 % de la prob. de la columna más probable
     min_prob_abs: float = 0.0,      # umbral absoluto opcional (p. ej. 1e-6)
     max_sorpresas: int = 4,         # máx. de signos que NO son el favorito del modelo
+    min_empates: int = 0,           # mín. de empates (X) por columna (en una jornada salen ~3-4)
     min_distancia: int = 2,         # las columnas elegidas difieren en >= 2 signos
     bote: float | None = None,      # € de la categoría objetivo (opcional)
     n_columnas: float | None = None,  # columnas totales jugadas en la jornada (opcional)
@@ -131,14 +133,18 @@ def optimizar(
 
     # Enumeración exacta por mitades: 3^15 ≈ 14 M combinaciones en una matriz A x B
     h = n // 2
-    cA, lpA, lsA, nsA = _enumerate_half(logP[:h], logS[:h], fav[:h])
-    cB, lpB, lsB, nsB = _enumerate_half(logP[h:], logS[h:], fav[h:])
+    cA, lpA, lsA, nsA, nxA = _enumerate_half(logP[:h], logS[:h], fav[:h])
+    cB, lpB, lsB, nsB, nxB = _enumerate_half(logP[h:], logS[h:], fav[h:])
     LP = lpA[:, None] + lpB[None, :]
     LS = lsA[:, None] + lsB[None, :]
     NS = nsA[:, None] + nsB[None, :]
+    NX = nxA[:, None] + nxB[None, :]
 
     # FILTRO DE PROBABILIDAD MÍNIMA (anti-quimeras) + límite de sorpresas
-    mask = (LP >= LP.max() + np.log(min_prob_rel)) & (NS <= max_sorpresas)
+    reglas = (NS <= max_sorpresas) & (NX >= min_empates)
+    if not reglas.any():
+        raise ValueError("Ninguna columna cumple las reglas: sube las sorpresas permitidas o baja el mínimo de empates.")
+    mask = (LP >= LP[reglas].max() + np.log(min_prob_rel)) & reglas
     if min_prob_abs > 0:
         mask &= LP >= np.log(min_prob_abs)
     n_validas = int(mask.sum())
@@ -176,6 +182,7 @@ def optimizar(
             "share_publico": s,
             "indice_valor": round(p / s, 2),   # >1 = juegas lo que el público infravalora
             "sorpresas": int((code != fav).sum()),
+            "empates": int((code == 1).sum()),
         }
         p15 = s15 = 1.0
         if pleno is not None:        # mejor marcador del partido 15 para esta columna
@@ -247,11 +254,12 @@ if __name__ == "__main__":
     ap.add_argument("--min-prob-rel", type=float, default=0.05)
     ap.add_argument("--min-prob-abs", type=float, default=0.0)
     ap.add_argument("--max-sorpresas", type=int, default=4)
+    ap.add_argument("--min-empates", type=int, default=0)
     ap.add_argument("--min-distancia", type=int, default=2)
     ap.add_argument("--bote", type=float, default=None)
     ap.add_argument("--n-columnas", type=float, default=None)
     ap.add_argument("--coste-columna", type=float, default=0.75)
     a = ap.parse_args()
     run(a.pred, a.k, a.peso_modelo, min_prob_signo=a.min_prob_signo, min_prob_rel=a.min_prob_rel,
-        min_prob_abs=a.min_prob_abs, max_sorpresas=a.max_sorpresas, min_distancia=a.min_distancia,
+        min_prob_abs=a.min_prob_abs, max_sorpresas=a.max_sorpresas, min_empates=a.min_empates, min_distancia=a.min_distancia,
         bote=a.bote, n_columnas=a.n_columnas, coste_columna=a.coste_columna)
