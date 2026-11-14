@@ -9,6 +9,7 @@ Archivos necesarios en la misma carpeta: quiniela_model.py, quiniela_optimizer.p
 quiniela_scraper.py, requirements.txt
 """
 import hmac
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -70,9 +71,26 @@ st.caption("Dixon-Coles + XGBoost frente al reparto de apuestas del público. He
 # --------------------------------------------------------------------------------------
 # 1) Modelo
 # --------------------------------------------------------------------------------------
+with st.expander("➕ Histórico extra: Liga F u otras competiciones (opcional)"):
+    st.caption("football-data.co.uk solo cubre Primera y Segunda. Para que el modelo conozca el fútbol femenino, "
+               "sube aquí un CSV de partidos con columnas Date, Home, Away, HG, AG (también vale el formato de "
+               "football-data o el «CSV de Partidos» de FootyStats). Para que quede fijo, súbelo a GitHub con el "
+               "nombre `liga_f.csv`, junto a app.py. Sin él, los partidos femeninos usan las cuotas de las casas.")
+    subido = st.file_uploader("CSV de partidos", type="csv")
+    es_fem = st.checkbox("Son partidos de fútbol femenino", value=True)
+
 try:
     with st.spinner("Descargando datos y entrenando el modelo (solo la primera vez, puede tardar ~1 min)…"):
         hist = cargar_historico()
+        extras = []
+        fijo = Path(__file__).parent / "liga_f.csv"
+        if fijo.exists():
+            extras.append(qm.parse_extra_csv(fijo, femenino=True))
+        if subido is not None:
+            extras.append(qm.parse_extra_csv(subido, femenino=es_fem))
+        if extras:
+            hist = pd.concat([hist] + extras).sort_values("Date").reset_index(drop=True)
+            st.caption(f"Histórico extra cargado: {sum(len(e) for e in extras)} partidos.")
         trained = entrenar(len(hist), str(hist.Date.max().date()), hist)
 except Exception as exc:
     st.error(f"No pude preparar el modelo: {exc}")
@@ -113,17 +131,18 @@ if jornada:
         "Local": [qs.map_team(n, known) or SIN_HIST for n in p.Local_quiniela],
         "Visitante": [qs.map_team(n, known) or SIN_HIST for n in p.Visitante_quiniela],
         "pct_1": p[f"{pref}_1"], "pct_X": p[f"{pref}_X"], "pct_2": p[f"{pref}_2"],
+        "mkt_1": p.prob_1, "mkt_X": p.prob_X, "mkt_2": p.prob_2,
     })
 else:
     st.error(f"No pude leer la jornada automáticamente: {error}")
     st.info("Puedes rellenar la tabla a mano: elige los equipos (nombres de football-data) y los % del público.")
     base = pd.DataFrame({"Partido": [f"Partido {i}" for i in range(1, 15)], "Local": SIN_HIST, "Visitante": SIN_HIST,
-                         "pct_1": 40, "pct_X": 30, "pct_2": 30})
+                         "pct_1": 40, "pct_X": 30, "pct_2": 30, "mkt_1": 0, "mkt_X": 0, "mkt_2": 0})
 
 sin = int(((base.Local == SIN_HIST) | (base.Visitante == SIN_HIST)).sum())
 with st.expander(f"📋 Revisar partidos y porcentajes ({len(base)} partidos · {sin} sin histórico)"):
-    st.caption("Los partidos «sin histórico» (femenino, otras categorías…) usan el % del público: no aportan ventaja. "
-               "Puedes corregir equipos y porcentajes.")
+    st.caption("Los partidos «sin histórico» usan las probabilidades de las casas de apuestas («Cuotas %») frente al "
+               "% del público; no se apoyan en tu modelo. Puedes corregir equipos y porcentajes.")
     opciones = [SIN_HIST] + known
     editada = st.data_editor(
         base, hide_index=True, width="stretch", num_rows="fixed", key="tabla_jornada",
@@ -134,6 +153,9 @@ with st.expander(f"📋 Revisar partidos y porcentajes ({len(base)} partidos · 
             "pct_1": st.column_config.NumberColumn("1 %", min_value=0, max_value=100),
             "pct_X": st.column_config.NumberColumn("X %", min_value=0, max_value=100),
             "pct_2": st.column_config.NumberColumn("2 %", min_value=0, max_value=100),
+            "mkt_1": st.column_config.NumberColumn("Cuotas 1 %", min_value=0, max_value=100),
+            "mkt_X": st.column_config.NumberColumn("Cuotas X %", min_value=0, max_value=100),
+            "mkt_2": st.column_config.NumberColumn("Cuotas 2 %", min_value=0, max_value=100),
         })
 
 pl = (jornada or {}).get("pleno")
@@ -185,6 +207,7 @@ fixtures = pd.DataFrame({
     "Away": [a if a != SIN_HIST else f"{r.Partido}|V" for a, r in zip(editada.Visitante, editada.itertuples())],
     "Date": pd.Timestamp.today().normalize(),
     "pct_1": editada.pct_1.astype(float), "pct_X": editada.pct_X.astype(float), "pct_2": editada.pct_2.astype(float),
+    "mkt_1": editada.mkt_1.astype(float), "mkt_X": editada.mkt_X.astype(float), "mkt_2": editada.mkt_2.astype(float),
 })
 if (fixtures[["pct_1", "pct_X", "pct_2"]].sum(axis=1) <= 0).any():
     st.warning("Hay partidos con los tres porcentajes a 0. Revisa la tabla.")
@@ -248,7 +271,7 @@ with st.expander("🔎 Análisis por signo (sesgo del público)"):
     st.dataframe(qo.sign_table(result, Pa, S, min_signo), hide_index=True, width="stretch")
     st.caption("★ = el público infravalora el signo (ratio ≥ 1,3) y tiene probabilidad real suficiente.")
 if result.sin_historico.any():
-    st.caption("Sin histórico (usan el % del público): " + ", ".join(
+    st.caption("Sin histórico (usan cuotas de las casas o, si no hay, el % del público): " + ", ".join(
         f"{h.split('|')[0]}" for h in result.Home[result.sin_historico]))
 with st.expander("📈 Calidad del modelo"):
     st.dataframe(trained["evaluation"], width="stretch")

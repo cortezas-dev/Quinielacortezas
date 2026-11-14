@@ -205,13 +205,39 @@ ALIASES = {
 }
 
 
+_NOISE = {"f", "femenino", "fem", "women", "w", "cf", "fc", "cff", "club", "de", "futbol", "cd", "ud", "sad", "rcd"}
+
+
+def _tokens(name: str) -> list[str]:
+    return [t for t in _norm(name.replace("F:", "")).split() if t not in _NOISE]
+
+
+def _map_fem(name: str, pool: list[str]) -> str | None:
+    """Equipo femenino: compara palabras (admite abreviaturas: 'ath' ~ 'athletic', 'r' ~ 'real')."""
+    q = _tokens(name)
+    if not q or not pool:
+        return None
+    best, best_key = None, (0.0, 0)
+    for cand in pool:
+        c = _tokens(cand)
+        hits = sum(any(ct.startswith(qt) for ct in c) for qt in q)
+        score = hits / len(q)
+        key = (score, -(len(c) - hits))             # a igualdad, el nombre más ajustado
+        if score >= 0.99 and key > best_key:
+            best, best_key = cand, key
+    return best
+
+
 def map_team(name: str, known: list[str]) -> str | None:
     """
-    Traduce el nombre de la Quiniela al de football-data. Devuelve None si no hay histórico
-    (equipos femeninos "(F)", otras categorías, selecciones...): el modelo usará el % del público.
+    Traduce el nombre de la Quiniela al del histórico. Los equipos femeninos "(F)" se buscan entre
+    los equipos 'F:...' del histórico extra. Devuelve None si no hay histórico: el modelo usará
+    las cuotas del mercado o el % del público.
     """
-    if "(F)" in name.upper():
-        return None
+    fem = "(F)" in name.upper()
+    if fem:
+        return _map_fem(name, [k for k in known if k.startswith("F:")])
+    known = [k for k in known if not k.startswith("F:")]
     n = _norm(name)
     for cand in ALIASES.get(n, []):
         if cand in known:

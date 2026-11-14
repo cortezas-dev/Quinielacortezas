@@ -17,6 +17,7 @@ CONVENCIÓN: clase 0 = "1" (gana local), 1 = "X" (empate), 2 = "2" (gana visitan
 """
 from __future__ import annotations
 
+import io
 import warnings
 from pathlib import Path
 
@@ -114,6 +115,50 @@ def load_history(n_seasons: int = 2, leagues: tuple[str, ...] = ("SP1", "SP2")) 
     if not frames:
         raise RuntimeError("Sin datos: revisa la conexión o descarga los CSV a mano en data_cache/.")
     return pd.concat(frames).sort_values("Date").reset_index(drop=True)
+
+
+# Formatos de CSV admitidos para histórico extra (fútbol femenino u otras competiciones)
+_EXTRA_FORMATS = [
+    ("Date", "Home", "Away", "HG", "AG"),                      # formato propio
+    ("Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG"),          # formato football-data.co.uk
+    ("date_GMT", "home_team_name", "away_team_name",           # formato FootyStats ("CSV de Partidos")
+     "home_team_goal_count", "away_team_goal_count"),
+]
+
+
+def parse_extra_csv(source, femenino: bool = True) -> pd.DataFrame:
+    """
+    Lee un CSV de partidos (ruta o archivo subido) y lo devuelve en el formato interno.
+    Con femenino=True los equipos se guardan como 'F:Nombre' para no mezclarlos con los masculinos
+    (p. ej. Real Madrid y Real Madrid Femenino). Solo se usan partidos ya jugados.
+    """
+    data = source.read() if hasattr(source, "read") else Path(source).read_bytes()
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = data.decode("latin-1")
+    raw = pd.read_csv(io.StringIO(text), sep=None, engine="python")
+    fmt = next((f for f in _EXTRA_FORMATS if all(c in raw.columns for c in f)), None)
+    if fmt is None:
+        raise ValueError("No reconozco las columnas. Necesito: Date, Home, Away, HG, AG "
+                         "(o las de football-data / FootyStats).")
+    dcol, hcol, acol, hg, ag = fmt
+    if "status" in raw.columns:
+        raw = raw[raw["status"].astype(str).str.lower().isin(["complete", "completed", "finished", "ft"])]
+    d = raw[dcol].astype(str)
+    dates = pd.to_datetime(d.str.split(" - ").str[0], format="%b %d %Y", errors="coerce")
+    if dates.isna().mean() > 0.5:
+        dates = pd.to_datetime(d, dayfirst=True, errors="coerce")
+    out = pd.DataFrame({"Date": dates, "Home": raw[hcol].astype(str).str.strip(),
+                        "Away": raw[acol].astype(str).str.strip(),
+                        "HG": pd.to_numeric(raw[hg], errors="coerce"), "AG": pd.to_numeric(raw[ag], errors="coerce")})
+    out = out.dropna().reset_index(drop=True)
+    out[["HG", "AG"]] = out[["HG", "AG"]].astype(int)
+    out["Result"] = np.select([out.HG > out.AG, out.HG == out.AG], [0, 1], default=2)
+    out[["mkt_p1", "mkt_px", "mkt_p2"]] = np.nan
+    if femenino:
+        out["Home"], out["Away"] = "F:" + out["Home"], "F:" + out["Away"]
+    return out
 
 
 # ======================================================================================
@@ -404,8 +449,9 @@ def train_pipeline(hist: pd.DataFrame, progress=None) -> dict:
 def predict_fixtures(hist: pd.DataFrame, fixtures: pd.DataFrame, trained: dict) -> pd.DataFrame:
     """
     Probabilidades 1X2 para la jornada. `fixtures`: Home, Away (nombres football-data)
-    y opcionalmente Date, pct_1/pct_X/pct_2. Equipos sin histórico (femenino, Primera
-    Federación, Copa...): se usa el % del público como probabilidad (sin ventaja).
+    y opcionalmente Date, pct_1/pct_X/pct_2. Equipos sin histórico (Primera
+    Federación, Copa...): se usan las probabilidades de las casas de apuestas (mkt_1/X/2) si
+    existen y, si no, el % del público (sin ventaja).
     """
     dc = trained["dc"]
     with warnings.catch_warnings():
@@ -416,11 +462,16 @@ def predict_fixtures(hist: pd.DataFrame, fixtures: pd.DataFrame, trained: dict) 
     result[["DC_1", "DC_X", "DC_2"]] = fx[["dc_p1", "dc_px", "dc_p2"]].round(3).to_numpy()
     known = (fixtures.Home.isin(dc.attack_) & fixtures.Away.isin(dc.attack_)).to_numpy()
     result["sin_historico"] = ~known
-    pub_cols = ["pct_1", "pct_X", "pct_2"]
+    pub_cols, mkt_cols = ["pct_1", "pct_X", "pct_2"], ["mkt_1", "mkt_X", "mkt_2"]
     if not known.all() and set(pub_cols) <= set(fixtures.columns):
         pub = fixtures[pub_cols].to_numpy(float)
         pub = pub / pub.sum(axis=1, keepdims=True)
-        result.loc[~known, ["P1", "PX", "P2"]] = pub[~known].round(3)
+        mk = (fixtures[mkt_cols].fillna(0).to_numpy(float) if set(mkt_cols) <= set(fixtures.columns)
+              else np.zeros_like(pub))
+        use_mk = mk.sum(axis=1) > 0
+        fallback = np.where(use_mk[:, None], mk / np.where(use_mk, mk.sum(axis=1), 1)[:, None], pub)
+        result.loc[~known, ["P1", "PX", "P2"]] = fallback[~known].round(3)
+        result["fuente_sin_hist"] = np.where(~known, np.where(use_mk, "cuotas", "público"), "")
     return result
 
 
