@@ -108,6 +108,52 @@ def _enumerate_half(logP, logS, fav):
     return codes, lp, ls, ns, nx
 
 
+# ======================================================================================
+# COBERTURA: repartir el riesgo entre columnas (simulación de resultados)
+# ======================================================================================
+def _simular(Pa: np.ndarray, n_sims: int, seed: int) -> np.ndarray:
+    """Resultados simulados (n_sims x n partidos) con 0 = '1', 1 = 'X', 2 = '2', según las probabilidades Pa."""
+    rng = np.random.default_rng(seed)
+    cdf = np.cumsum(Pa, axis=1)[:, :2]
+    u = rng.random((n_sims, Pa.shape[0]))
+    return (u[:, :, None] > cdf[None, :, :]).sum(axis=2).astype(np.int8)
+
+
+def _hits(cand: np.ndarray, sims: np.ndarray) -> np.ndarray:
+    """Aciertos de cada columna (filas) en cada resultado simulado (columnas)."""
+    hits = np.zeros((cand.shape[0], sims.shape[0]), dtype=np.int8)
+    for m in range(cand.shape[1]):
+        hits += cand[:, m][:, None] == sims[:, m][None, :]
+    return hits
+
+
+def _greedy_cobertura(cand, p_exact, sims, k, cobertura):
+    """
+    Elige k columnas de la lista candidata que se COMPLEMENTAN: en cada paso añade la que más
+    aumenta el valor esperado de la mejor columna del conjunto, donde
+        14 aciertos vale 1 y 13 aciertos vale c = 0,3 * cobertura (12 -> c/4, 11 -> c/16 ...).
+    Con cobertura alta se prefieren columnas que cubren los fallos de las demás (p. ej. el otro
+    signo en el partido más dudoso); con cobertura 0 sería simplemente "las más probables".
+    El término de 14 aciertos usa la probabilidad exacta (en simulación casi nunca aparece).
+    """
+    M, n = cand.shape
+    hits = _hits(cand, sims)
+    c = 0.3 * cobertura
+    w = np.zeros(n + 1, dtype=np.float32)
+    w[n] = 1.0
+    for j in range(1, 5):
+        w[n - j] = c / (4 ** (j - 1))
+    best = np.zeros(sims.shape[0], dtype=np.int8)
+    chosen: list[int] = []
+    for _ in range(min(k, M)):
+        gain = (w[np.maximum(hits, best[None, :])] - w[best][None, :]).mean(axis=1) + p_exact
+        gain[chosen] = -np.inf
+        j = int(np.argmax(gain))
+        chosen.append(j)
+        best = np.maximum(best, hits[j])
+    return chosen
+
+
 def optimizar(
     Pa: np.ndarray,
     S: np.ndarray,
@@ -122,6 +168,9 @@ def optimizar(
     n_columnas: float | None = None,  # columnas totales jugadas en la jornada (opcional)
     coste_columna: float = 0.75,    # € por columna (VERIFICA el precio vigente)
     n_candidatos: int = 20000,
+    cobertura: float = 0.0,         # 0 = las más probables; hasta 1 = reparte el riesgo entre columnas
+    n_sims: int = 10000,
+    seed: int = 7,
     pleno: tuple | None = None,     # (Pp, Sp): matrices 4x4 modelo y público del partido 15
 ) -> pd.DataFrame:
     n = Pa.shape[0]
@@ -160,17 +209,27 @@ def optimizar(
     top = np.argpartition(score, -m)[-m:]
     top = top[np.argsort(-score[top])]
 
-    # SELECCIÓN CON DIVERSIDAD: evita 10 columnas casi idénticas
     nB = LP.shape[1]
     chosen_idx, chosen_codes = [], []
-    for t in top:
-        ia, ib = divmod(int(t), nB)
-        code = np.concatenate([cA[ia], cB[ib]])
-        if all((code != c).sum() >= min_distancia for c in chosen_codes):
-            chosen_idx.append((ia, ib))
-            chosen_codes.append(code)
-            if len(chosen_codes) == k:
-                break
+    if cobertura > 0:
+        # SELECCIÓN POR COBERTURA: entre las mejores candidatas (ya ordenadas por valor), las que se complementan
+        pool = top[:min(len(top), 1000)]
+        ia_p, ib_p = pool // nB, pool % nB
+        cand = np.hstack([cA[ia_p], cB[ib_p]])
+        p_exact = np.exp(LP.reshape(-1)[pool]).astype(np.float32)
+        picks = _greedy_cobertura(cand, p_exact, _simular(Pa, n_sims, seed), k, cobertura)
+        chosen_idx = [(int(ia_p[i]), int(ib_p[i])) for i in picks]
+        chosen_codes = [cand[i] for i in picks]
+    else:
+        # SELECCIÓN CON DIVERSIDAD: evita columnas casi idénticas
+        for t in top:
+            ia, ib = divmod(int(t), nB)
+            code = np.concatenate([cA[ia], cB[ib]])
+            if all((code != c).sum() >= min_distancia for c in chosen_codes):
+                chosen_idx.append((ia, ib))
+                chosen_codes.append(code)
+                if len(chosen_codes) == k:
+                    break
 
     out = []
     for (ia, ib), code in zip(chosen_idx, chosen_codes):
@@ -197,6 +256,11 @@ def optimizar(
             row["EV_sobre_coste"] = round(row["EV_euros"] / coste_columna, 3)
         out.append(row)
     res = pd.DataFrame(out)
+    codes = np.array(chosen_codes)
+    ev_hits = _hits(codes, _simular(Pa, 40000, seed + 1))          # aciertos de tus K columnas en 40.000 jornadas simuladas
+    res.attrs["p_14"] = float(res.P_conjunta.sum())                # probabilidad exacta de 14 con alguna de las columnas
+    res.attrs["p_13mas"] = float((ev_hits.max(axis=0) >= n - 1).mean())
+    res.attrs["reparto"] = np.array([[int((codes[:, m] == s).sum()) for s in range(3)] for m in range(n)])
     res.attrs["n_validas"] = n_validas
     res.attrs["ev_mode"] = ev_mode
     return res

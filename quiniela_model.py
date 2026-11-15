@@ -70,7 +70,7 @@ def download_season(start_year: int, league: str = "SP1", force: bool = False) -
     return pd.read_csv(path, encoding="latin-1", on_bad_lines="skip")
 
 
-def clean_matches(raw: pd.DataFrame) -> pd.DataFrame:
+def clean_matches(raw: pd.DataFrame, liga: str = "Otra") -> pd.DataFrame:
     """Normaliza columnas: Date, Home, Away, HG, AG, Result (0/1/2) y probs. del mercado."""
     df = raw.dropna(subset=["HomeTeam", "AwayTeam", "FTHG", "FTAG"]).copy()
     df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
@@ -94,6 +94,7 @@ def clean_matches(raw: pd.DataFrame) -> pd.DataFrame:
             fill = np.isnan(mkt[:, 0]) & ~np.isnan(probs[:, 0])
             mkt[fill] = probs[fill]
     out[["mkt_p1", "mkt_px", "mkt_p2"]] = mkt
+    out["Liga"] = liga
     return out
 
 
@@ -109,12 +110,22 @@ def load_history(n_seasons: int = 2, leagues: tuple[str, ...] = ("SP1", "SP2")) 
         for k in range(n_seasons):
             year = start - k
             try:
-                frames.append(clean_matches(download_season(year, league, force=(k == 0))))
+                frames.append(clean_matches(download_season(year, league, force=(k == 0)),
+                                            liga={"SP1": "Primera", "SP2": "Segunda"}.get(league, league)))
             except Exception as exc:  # temporada sin fichero aún, sin red, etc.
                 warnings.warn(f"No se pudo cargar {league} {year}/{year + 1}: {exc}")
     if not frames:
         raise RuntimeError("Sin datos: revisa la conexión o descarga los CSV a mano en data_cache/.")
     return pd.concat(frames).sort_values("Date").reset_index(drop=True)
+
+
+def team_competitions(hist: pd.DataFrame) -> dict:
+    """Competición actual de cada equipo (la de su último partido): Primera, Segunda, Liga F, Selección…"""
+    if "Liga" not in hist.columns:
+        return {}
+    both = pd.concat([hist[["Date", "Home", "Liga"]].rename(columns={"Home": "T"}),
+                      hist[["Date", "Away", "Liga"]].rename(columns={"Away": "T"})])
+    return both.sort_values("Date").groupby("T")["Liga"].last().to_dict()
 
 
 # Formatos de CSV admitidos para histórico extra (fútbol femenino u otras competiciones)
@@ -156,6 +167,7 @@ def parse_extra_csv(source, femenino: bool = True) -> pd.DataFrame:
     out[["HG", "AG"]] = out[["HG", "AG"]].astype(int)
     out["Result"] = np.select([out.HG > out.AG, out.HG == out.AG], [0, 1], default=2)
     out[["mkt_p1", "mkt_px", "mkt_p2"]] = np.nan
+    out["Liga"] = "Liga F" if femenino else "Otra"
     if femenino:
         out["Home"], out["Away"] = "F:" + out["Home"], "F:" + out["Away"]
     return out
@@ -266,7 +278,7 @@ class DixonColes:
         return np.array([np.tril(m, -1).sum(), np.trace(m), np.triu(m, 1).sum()])
 
 
-def dc_walk_forward(df: pd.DataFrame, min_train: int = 150, step_days: int = 14, **dc_kwargs) -> np.ndarray:
+def dc_walk_forward(df: pd.DataFrame, min_train: int = 150, step_days: int = 14, since=None, **dc_kwargs) -> np.ndarray:
     """
     Probabilidades Dixon-Coles 'fuera de muestra': cada partido se predice con un modelo
     entrenado SOLO con partidos anteriores (reajuste cada `step_days` días).
@@ -275,6 +287,8 @@ def dc_walk_forward(df: pd.DataFrame, min_train: int = 150, step_days: int = 14,
     df = df.sort_values("Date").reset_index(drop=True)
     out = np.full((len(df), 3), np.nan)
     first = df.Date.iloc[min_train]
+    if since is not None:                      # solo se evalúa/entrena XGBoost con partidos recientes (más rápido)
+        first = max(first, pd.Timestamp(since))
     starts = list(pd.date_range(first, df.Date.max(), freq=f"{step_days}D"))
     ends = starts[1:] + [df.Date.max() + pd.Timedelta(days=1)]
     for b0, b1 in zip(starts, ends):
@@ -420,11 +434,13 @@ def fixture_features(hist: pd.DataFrame, fixtures: pd.DataFrame, dc: DixonColes)
 def train_pipeline(hist: pd.DataFrame, progress=None) -> dict:
     """
     Parte pesada (conviene cachearla): Dixon-Coles fuera de muestra + XGBoost calibrado
-    + evaluación temporal (80 % antiguo / 20 % reciente) contra Dixon-Coles y mercado.
+    + evaluación temporal (80 % antiguo / 20 % reciente). Solo se usan para XGBoost los
+    ~500 últimos días (el Dixon-Coles sí usa todo el histórico, con peso decreciente).
     """
     say = progress or (lambda msg: None)
     say("Dixon-Coles fuera de muestra…")
-    dc_oos = dc_walk_forward(hist, min_train=150, step_days=14)
+    since = hist.Date.max() - pd.Timedelta(days=500)
+    dc_oos = dc_walk_forward(hist, min_train=150, step_days=14, since=since)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         data = build_features(add_context(add_rest_and_form(hist)), dc_oos)
@@ -434,44 +450,70 @@ def train_pipeline(hist: pd.DataFrame, progress=None) -> dict:
     cut = int(len(data) * 0.8)
     train, test = data.iloc[:cut], data.iloc[cut:]
     tmp = QuinielaModel().fit(train, train.Result.to_numpy())
-    comparison = {"Dixon-Coles": test[["dc_p1", "dc_px", "dc_p2"]].to_numpy(),
-                  "DC + XGBoost calibrado": tmp.predict_proba(test)}
+    y = test.Result.to_numpy()
+    comp = {"Dixon-Coles": test[["dc_p1", "dc_px", "dc_p2"]].to_numpy(),
+            "DC + XGBoost calibrado": tmp.predict_proba(test)}
+    evaluation = evaluate(y, comp)
     mk = test[["mkt_p1", "mkt_px", "mkt_p2"]].to_numpy()
-    if not np.isnan(mk).any():
-        comparison["Mercado (sin margen)"] = mk
-    evaluation = evaluate(test.Result.to_numpy(), comparison)
+    ok = ~np.isnan(mk).any(axis=1)
+    evaluation_market = None
+    if ok.sum() >= 60:                      # solo partidos con cuotas (Primera y Segunda)
+        comp_m = {k: v[ok] for k, v in comp.items()}
+        comp_m["Mercado (casas, sin margen)"] = mk[ok]
+        evaluation_market = evaluate(y[ok], comp_m)
 
     say("Entrenando el modelo final…")
     final = QuinielaModel().fit(data, data.Result.to_numpy())
-    return {"final": final, "dc": DixonColes().fit(hist), "evaluation": evaluation, "n_matches": len(hist)}
+    return {"final": final, "dc": DixonColes().fit(hist), "evaluation": evaluation,
+            "evaluation_market": evaluation_market, "n_matches": len(hist), "n_test": len(test)}
 
 
-def predict_fixtures(hist: pd.DataFrame, fixtures: pd.DataFrame, trained: dict) -> pd.DataFrame:
+def predict_fixtures(hist: pd.DataFrame, fixtures: pd.DataFrame, trained: dict, alpha: float = 0.5) -> pd.DataFrame:
     """
-    Probabilidades 1X2 para la jornada. `fixtures`: Home, Away (nombres football-data)
-    y opcionalmente Date, pct_1/pct_X/pct_2. Equipos sin histórico (Primera
-    Federación, Copa...): se usan las probabilidades de las casas de apuestas (mkt_1/X/2) si
-    existen y, si no, el % del público (sin ventaja).
+    Probabilidades 1X2 de la jornada. `fixtures`: Home, Away (nombres del histórico) y opcionalmente
+    Date, pct_1/pct_X/pct_2 (público) y mkt_1/mkt_X/mkt_2 (casas de apuestas, en %).
+    Estimación final por partido ('fuente'):
+        modelo + casas : alpha * modelo + (1 - alpha) * casas   (equipos con histórico y cuotas)
+        modelo         : solo modelo                            (con histórico, sin cuotas)
+        casas          : solo cuotas de las casas               (equipo sin histórico)
+        público        : % del público, sin ventaja             (sin histórico ni cuotas)
     """
     dc = trained["dc"]
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         fx = fixture_features(hist, fixtures, dc)
-    result = fixtures.copy()
-    result[["P1", "PX", "P2"]] = trained["final"].predict_proba(fx).round(3)
-    result[["DC_1", "DC_X", "DC_2"]] = fx[["dc_p1", "dc_px", "dc_p2"]].round(3).to_numpy()
+    model_p = trained["final"].predict_proba(fx)
+    n = len(fixtures)
     known = (fixtures.Home.isin(dc.attack_) & fixtures.Away.isin(dc.attack_)).to_numpy()
+
+    def norm_cols(cols):
+        if not set(cols) <= set(fixtures.columns):
+            return np.zeros((n, 3)), np.zeros(n, dtype=bool)
+        v = fixtures[cols].fillna(0).to_numpy(float)
+        s = v.sum(axis=1)
+        return v / np.where(s > 0, s, 1)[:, None], s > 0
+
+    pub, has_pub = norm_cols(["pct_1", "pct_X", "pct_2"])
+    pub = np.where(has_pub[:, None], pub, 1 / 3)
+    mk, has_mk = norm_cols(["mkt_1", "mkt_X", "mkt_2"])
+
+    P = np.empty((n, 3))
+    fuente = np.empty(n, dtype=object)
+    for i in range(n):
+        if known[i] and has_mk[i]:
+            P[i], fuente[i] = alpha * model_p[i] + (1 - alpha) * mk[i], "modelo + casas"
+        elif known[i]:
+            P[i], fuente[i] = model_p[i], "modelo"
+        elif has_mk[i]:
+            P[i], fuente[i] = mk[i], "casas"
+        else:
+            P[i], fuente[i] = pub[i], "público"
+    result = fixtures.copy()
+    result[["P1", "PX", "P2"]] = P.round(4)
+    result[["mod_1", "mod_X", "mod_2"]] = model_p.round(4)
+    result[["DC_1", "DC_X", "DC_2"]] = fx[["dc_p1", "dc_px", "dc_p2"]].round(3).to_numpy()
     result["sin_historico"] = ~known
-    pub_cols, mkt_cols = ["pct_1", "pct_X", "pct_2"], ["mkt_1", "mkt_X", "mkt_2"]
-    if not known.all() and set(pub_cols) <= set(fixtures.columns):
-        pub = fixtures[pub_cols].to_numpy(float)
-        pub = pub / pub.sum(axis=1, keepdims=True)
-        mk = (fixtures[mkt_cols].fillna(0).to_numpy(float) if set(mkt_cols) <= set(fixtures.columns)
-              else np.zeros_like(pub))
-        use_mk = mk.sum(axis=1) > 0
-        fallback = np.where(use_mk[:, None], mk / np.where(use_mk, mk.sum(axis=1), 1)[:, None], pub)
-        result.loc[~known, ["P1", "PX", "P2"]] = fallback[~known].round(3)
-        result["fuente_sin_hist"] = np.where(~known, np.where(use_mk, "cuotas", "público"), "")
+    result["fuente"] = fuente
     return result
 
 

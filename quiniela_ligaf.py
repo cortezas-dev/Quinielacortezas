@@ -154,4 +154,5 @@ def load_liga_f(n_seasons: int = 2) -> pd.DataFrame:
     out["Result"] = np.select([out.HG > out.AG, out.HG == out.AG], [0, 1], default=2)
     out[["mkt_p1", "mkt_px", "mkt_p2"]] = np.nan
     out["Home"], out["Away"] = "F:" + out["Home"], "F:" + out["Away"]
+    out["Liga"] = "Liga F"
     return out

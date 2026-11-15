@@ -23,6 +23,8 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
+from quiniela_selecciones import is_seleccion_name, map_seleccion
+
 URL = "https://www.eduardolosilla.es/"
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; QuinielaPersonalApp/1.0)", "Accept-Language": "es-ES,es;q=0.9"}
 
@@ -228,22 +230,60 @@ def _map_fem(name: str, pool: list[str]) -> str | None:
     return best
 
 
+_CLUB_PREFIX = {"cd", "ad", "fc", "ce", "ud", "cf", "sd", "rcd", "rc", "cp", "sad"}
+
+ALIASES.update({
+    "r sociedad b": ["Sociedad B"], "real sociedad b": ["Sociedad B"], "sociedad b": ["Sociedad B"],
+    "sporting gijon": ["Sp Gijon", "Sporting Gijon"], "andorra": ["Andorra"], "castellon": ["Castellon"],
+    "ceuta": ["Ceuta"], "eldense": ["Eldense"], "sabadell": ["Sabadell"], "oviedo": ["Oviedo"],
+    "tenerife": ["Tenerife"], "granada": ["Granada"], "burgos": ["Burgos"], "albacete": ["Albacete"],
+    "zaragoza": ["Zaragoza"], "cultural leonesa": ["Cultural Leonesa"], "r racing": ["Santander"],
+    "racing": ["Santander", "Racing Santander"],
+})
+
+
+def _strip_prefix(n: str) -> str:
+    return " ".join(t for t in n.split() if t not in _CLUB_PREFIX) or n
+
+
 def map_team(name: str, known: list[str]) -> str | None:
     """
-    Traduce el nombre de la Quiniela al del histórico. Los equipos femeninos "(F)" se buscan entre
-    los equipos 'F:...' del histórico extra. Devuelve None si no hay histórico: el modelo usará
-    las cuotas del mercado o el % del público.
+    Traduce el nombre de la Quiniela al del histórico:
+      · "(F)" / "FEM." -> equipos femeninos ('F:...')
+      · clubes de Primera y Segunda (admite CD, AD, FC, CE..., alias y nombres parecidos)
+      · selecciones ('S:...'), con el nombre en español (BÉLGICA -> S:Belgium)
+    Devuelve None si no hay histórico: el modelo usará las cuotas de las casas o el % del público.
     """
-    fem = "(F)" in name.upper()
-    if fem:
+    up = name.upper().replace(".", " ")
+    if "(F)" in up or re.search(r"\bFEM\b", up):
         return _map_fem(name, [k for k in known if k.startswith("F:")])
-    known = [k for k in known if not k.startswith("F:")]
-    n = _norm(name)
-    for cand in ALIASES.get(n, []):
-        if cand in known:
-            return cand
-    by_norm = {_norm(k): k for k in known}
-    if n in by_norm:
-        return by_norm[n]
-    close = difflib.get_close_matches(n, list(by_norm), n=1, cutoff=0.8)
+    clubs = [k for k in known if not k.startswith(("F:", "S:"))]
+    n = re.sub(r"\s+", " ", _norm(name))
+    n2 = _strip_prefix(n)
+    by_norm: dict[str, str] = {}
+    for k in clubs:
+        by_norm[_norm(k)] = k
+        by_norm.setdefault(_strip_prefix(_norm(k)), k)
+    for key in (n, n2):
+        for cand in ALIASES.get(key, []):
+            if cand in clubs:
+                return cand
+    for key in (n, n2):
+        if key in by_norm:
+            return by_norm[key]
+    sel = map_seleccion(name, known)
+    if sel:
+        return sel
+    close = difflib.get_close_matches(n2, list(by_norm), n=1, cutoff=0.8)
     return by_norm[close[0]] if close else None
+
+
+def map_match(local: str, visitante: str, known: list[str]) -> tuple[str | None, str | None]:
+    """Mapea un partido entero. Si un equipo es selección, el otro también (p. ej. ANDORRA - ESPAÑA)."""
+    a, b = map_team(local, known), map_team(visitante, known)
+    if (a or "").startswith("S:") ^ (b or "").startswith("S:"):
+        if not (a or "").startswith("S:") and is_seleccion_name(local):
+            a = map_seleccion(local, known) or a
+        if not (b or "").startswith("S:") and is_seleccion_name(visitante):
+            b = map_seleccion(visitante, known) or b
+    return a, b
