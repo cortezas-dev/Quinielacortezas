@@ -19,6 +19,7 @@ import difflib
 import re
 import unicodedata
 
+import numpy as np
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
@@ -49,8 +50,60 @@ def _money(text: str, pattern: str) -> float | None:
     return float(m.group(1).replace(".", "").replace(",", ".")) if m else None
 
 
+_DIAS = {"LUN": 0, "MAR": 1, "MIE": 2, "JUE": 3, "VIE": 4, "SAB": 5, "DOM": 6}
+_DASH = {"-", "–", "—"}
+
+
+def _ascii_up(x: str) -> str:
+    return unicodedata.normalize("NFKD", x).encode("ascii", "ignore").decode().upper().strip()
+
+
+def _read_values(lines: list[str], limit: int) -> list[float]:
+    """
+    Lee hasta `limit` valores consecutivos: números (%) o '-' (= todavía no disponible -> NaN).
+    La web pone '-' en los % de LAE antes de que se publiquen y en las cuotas de partidos sin cuotas.
+    """
+    out: list[float] = []
+    for ln in lines:
+        for tok in re.split(r"\s+", ln.replace("%", " ").strip()):
+            if re.fullmatch(r"\d{1,3}", tok):
+                out.append(float(tok))
+            elif tok in _DASH:
+                out.append(np.nan)
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def _parse_cierre(text: str) -> dict | None:
+    """'CIERRE MARTES 17/11' + '19:45H para Particulares' -> fecha y hora de cierre."""
+    m = re.search(r"CIERRE\s+([A-ZÁÉÍÓÚ]+)\s+(\d{1,2})/(\d{1,2})", text)
+    if not m:
+        return None
+    hora = re.search(r"(\d{1,2}:\d{2})\s*H\s+para\s+Particulares", text, flags=re.I)
+    today = pd.Timestamp.today().normalize()
+    try:
+        fecha = pd.Timestamp(year=today.year, month=int(m.group(3)), day=int(m.group(2)))
+    except ValueError:
+        return None
+    if fecha < today - pd.Timedelta(days=200):
+        fecha = fecha + pd.DateOffset(years=1)
+    return {"dia": m.group(1).title(), "fecha": fecha, "hora": hora.group(1) if hora else None}
+
+
+def _fecha_partido(dia: str, cierre: dict | None):
+    """Día de la semana ('MAR') -> fecha real, buscando desde el día de cierre de la jornada."""
+    if not dia or not cierre or dia not in _DIAS:
+        return pd.NaT
+    for k in range(8):
+        d = cierre["fecha"] + pd.Timedelta(days=k)
+        if d.weekday() == _DIAS[dia]:
+            return d
+    return pd.NaT
+
+
 def parse_lines(lines: list[str]) -> dict:
-    """Convierte las líneas de texto de la página en un diccionario con jornada y partidos."""
+    """Convierte las líneas de texto de la página en un diccionario con jornada, partidos, pleno y cierre."""
     # Une "7" + "MÁLAGA - RACING S." si el número de partido viene en una línea aparte
     merged: list[str] = []
     i = 0
@@ -79,6 +132,7 @@ def parse_lines(lines: list[str]) -> dict:
         raise ScrapeError("No encontré la tabla de partidos (¿la página carga los datos con JavaScript "
                           "o ha cambiado de diseño?).")
 
+    cierre = _parse_cierre(text)
     rows = []
     for pos, (k, m) in enumerate(seq):
         end = seq[pos + 1][0] if pos + 1 < len(seq) else min(k + 45, len(lines))
@@ -93,20 +147,15 @@ def parse_lines(lines: list[str]) -> dict:
                 break
         if start is None:
             continue
-        nums = []
-        for ln in block[start:]:
-            for tok in re.split(r"\s+", ln.replace("%", " ")):
-                if re.fullmatch(r"\d{1,3}", tok):
-                    nums.append(int(tok))
-            if len(nums) >= 12:
-                break
+        nums = _read_values(block[start:], 12)
         if len(nums) < 12:
             continue
-        hora = next((x for x in block[:start] if re.fullmatch(r"\d{1,2}:\d{2}", x)), "")
-        dia = next((x for x in block[:start] if x in {"SAB", "DOM", "VIE", "LUN", "MAR", "MIE", "JUE"}), "")
+        previo = [_ascii_up(x) for x in block[:start]]
+        hora = next((x for x in previo if re.fullmatch(r"\d{1,2}:\d{2}", x)), "")
+        dia = next((x for x in previo if x in _DIAS), "")
         rows.append({
             "Nº": int(m.group(1)), "Local_quiniela": m.group(2).strip(), "Visitante_quiniela": m.group(3).strip(),
-            "Dia": dia, "Hora": hora,
+            "Dia": dia, "Hora": hora, "Fecha": _fecha_partido(dia, cierre),
             "jug_1": nums[0], "jug_X": nums[1], "jug_2": nums[2],
             "lae_1": nums[3], "lae_X": nums[4], "lae_2": nums[5],
             "prob_1": nums[6], "prob_X": nums[7], "prob_2": nums[8],
@@ -115,31 +164,28 @@ def parse_lines(lines: list[str]) -> dict:
         raise ScrapeError("Encontré los partidos pero no los porcentajes (cambio de formato).")
 
     jornada = re.search(r"JORNADA\s+(\d+)", text)
-    pleno = _parse_pleno(lines, seq[-1][0])
     return {
         "jornada": int(jornada.group(1)) if jornada else None,
         "cerrada": bool(re.search(r"JUEGO\s+CERRADO", text, flags=re.I)),
+        "cierre": cierre,
         "bote": _money(text, r"\bBote"),
         "premio_max": _money(text, r"puede\s+ganar"),
         "partidos": pd.DataFrame(rows),
-        "pleno": pleno,
+        "pleno": _parse_pleno(lines, seq[-1][0], cierre),
     }
 
 
-_DIAS = {"SAB", "DOM", "VIE", "LUN", "MAR", "MIE", "JUE"}
-
-
-def _parse_pleno(lines: list[str], after: int) -> dict | None:
+def _parse_pleno(lines: list[str], after: int, cierre: dict | None = None) -> dict | None:
     """
-    Partido 15 (Pleno al 15): cada equipo marca 0, 1, 2 o M (3 o más). La página da, por
-    grupo (jugados, LAE, probables, jugados), 4 % del local y 4 % del visitante.
+    Partido 15 (Pleno al 15): cada equipo marca 0, 1, 2 o M (3 o más). La página da, por grupo
+    (jugados, LAE, probables, jugados), 4 % del local y 4 % del visitante. '-' = no disponible (NaN).
     Devuelve None si no se encuentra (la app permite rellenarlo a mano).
     """
     start = next((k for k in range(after + 1, len(lines))
                   if re.match(r"^15(\s+\S.*)?$", lines[k]) and not re.search(r"\d{1,2}:\d{2}", lines[k])), None)
     if start is None:
         return None
-    block = lines[start:start + 70]
+    block = lines[start:start + 80]
     names = []
     first = re.match(r"^15\s*(.*)$", block[0]).group(1).strip()
     if first:
@@ -147,11 +193,13 @@ def _parse_pleno(lines: list[str], after: int) -> dict | None:
     for ln in block[1:]:
         if len(names) >= 2:
             break
-        if ln in _DIAS or re.search(r"\d{1,2}:\d{2}", ln) or re.fullmatch(r"[\d\sM]+", ln):
+        if _ascii_up(ln) in _DIAS or re.search(r"\d{1,2}:\d{2}", ln) or re.fullmatch(r"[\d\sM]+", ln):
             break
         names.append(ln)
-    # último marcador "0 1 2 M" y los 32 números que le siguen
-    end = None
+    previo = [_ascii_up(x) for x in block[:12]]
+    dia = next((x for x in previo if x in _DIAS), "")
+    hora = next((x for x in previo if re.fullmatch(r"\d{1,2}:\d{2}", x)), "")
+    end = None                                       # último marcador "0 1 2 M"
     for j, ln in enumerate(block):
         if ln.replace(" ", "") == "012M":
             end = j
@@ -159,18 +207,15 @@ def _parse_pleno(lines: list[str], after: int) -> dict | None:
             end = j
     if end is None:
         return None
-    nums = []
-    for ln in block[end + 1:]:
-        for tok in re.split(r"\s+", ln.replace("%", " ")):
-            if re.fullmatch(r"\d{1,3}", tok):
-                nums.append(int(tok))
-        if len(nums) >= 32:
-            break
+    nums = _read_values(block[end + 1:], 32)
     if len(nums) < 16:
         return None
     return {
-        "Local_quiniela": names[0] if names else "", "Visitante_quiniela": names[1] if len(names) > 1 else "",
+        "Local_quiniela": names[0].strip() if names else "", "Visitante_quiniela": names[1].strip() if len(names) > 1 else "",
+        "Dia": dia, "Hora": hora, "Fecha": _fecha_partido(dia, cierre),
         "jug_H": nums[0:4], "jug_A": nums[4:8], "lae_H": nums[8:12], "lae_A": nums[12:16],
+        "prob_H": nums[16:20] if len(nums) >= 24 else [np.nan] * 4,
+        "prob_A": nums[20:24] if len(nums) >= 24 else [np.nan] * 4,
     }
 
 

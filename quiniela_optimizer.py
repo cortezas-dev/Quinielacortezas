@@ -172,6 +172,7 @@ def optimizar(
     n_sims: int = 10000,
     seed: int = 7,
     pleno: tuple | None = None,     # (Pp, Sp): matrices 4x4 modelo y público del partido 15
+    pleno_probable: bool = False,   # True: el marcador más probable; False: el de mejor valor (poco jugado)
 ) -> pd.DataFrame:
     n = Pa.shape[0]
     fav = Pa.argmax(axis=1)
@@ -246,7 +247,7 @@ def optimizar(
         p15 = s15 = 1.0
         if pleno is not None:        # mejor marcador del partido 15 para esta columna
             Pp, Sp = pleno
-            crit = Pp / (1 + n_columnas * s * Sp) if ev_mode else Pp
+            crit = Pp / (1 + n_columnas * s * Sp) if (ev_mode and not pleno_probable) else Pp
             i, j = np.unravel_index(np.argmax(crit), crit.shape)
             p15, s15 = float(Pp[i, j]), float(Sp[i, j])
             row["pleno"] = f"{PLENO[i]}-{PLENO[j]}"
